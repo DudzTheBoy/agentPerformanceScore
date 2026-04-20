@@ -1,0 +1,214 @@
+import pandas as pd
+from sqlalchemy import create_engine, event, text
+from datetime import datetime, timedelta
+import json
+import time
+import atexit
+
+# ============================
+# 1. Carregar o arquivo de configuração
+# ============================
+with open(rf'\\10.205.218.210\DGRedeBB\Planejamento_MIS\04_MIS\SCRIPTS_PYTHON\config\config.json', 'r') as f:
+    config = json.load(f)
+
+# ============================
+# 2. Engine para INFO_CENTRAL (destino)
+# ============================
+info_central = config['INFO_CENTRAL']
+engine_destino = create_engine(
+    f"mssql+pyodbc://{info_central['usuario']}:{info_central['senha']}@{info_central['servidor']}/{info_central['banco']}?driver=ODBC+Driver+17+for+SQL+Server"
+)
+atexit.register(engine_destino.dispose)
+
+@event.listens_for(engine_destino, "before_cursor_execute")
+def fast_exec_dest(conn, cursor, statement, parameters, context, executemany):
+    if executemany:
+        cursor.fast_executemany = True
+
+# ============================
+# 3. Engine para BSGAG001_DB (origem)
+# ============================
+bsg = config['BSGAG001_DB']
+engine_origem = create_engine(
+    f"mssql+pyodbc://{bsg['usuario']}:{bsg['senha']}@{bsg['servidor']}/{bsg['banco']}?driver=ODBC+Driver+17+for+SQL+Server"
+)
+atexit.register(engine_origem.dispose)
+
+@event.listens_for(engine_origem, "before_cursor_execute")
+def fast_exec_src(conn, cursor, statement, parameters, context, executemany):
+    if executemany:
+        cursor.fast_executemany = True
+
+# ============================
+# 4. Definição de datas
+# ============================
+dt_inicio = '2026-01-01'
+dt_fim_evento = (datetime.now() - timedelta(days=4)).strftime('%Y-%m-%d')   # para temp prêmios
+dt_fim_atend  = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')   # para query principal
+
+print(f"Período eventos: {dt_inicio} até {dt_fim_evento}")
+print(f"Período atendimentos: {dt_inicio} até {dt_fim_atend}")
+
+# ============================
+# 5. SQL — criar temp tables + SELECT (na ORIGEM)
+# ============================
+sql_setup = f"""
+CREATE TABLE #sucesso (
+    classe_processo_id INT NOT NULL PRIMARY KEY
+);
+
+INSERT INTO #sucesso (classe_processo_id)
+SELECT classe_processo_id
+FROM classe_processo WITH (NOLOCK)
+WHERE classe_processo LIKE '%- Sucesso%';
+
+CREATE TABLE #campos (
+    evento_id INT NOT NULL PRIMARY KEY,
+    premio    FLOAT NULL
+);
+
+INSERT INTO #campos (evento_id, premio)
+SELECT
+    a.evento_id,
+    TRY_CONVERT(FLOAT,
+        MAX(CASE WHEN a.campo_aux_id IN (2047, 2405)
+                 THEN REPLACE(a.campo_txt, ',', '.')
+            END)
+    )
+FROM evento_aux a WITH (NOLOCK)
+INNER JOIN evento b WITH (NOLOCK)
+    ON a.evento_id = b.evento_id
+INNER JOIN #sucesso sc
+    ON sc.classe_processo_id = b.classe_processo_id
+WHERE a.campo_aux_id IN (2047, 2405)
+  AND b.Dt_Evento >= '{dt_inicio}'
+  AND b.Dt_Evento <  '{dt_fim_evento}'
+GROUP BY a.evento_id;
+"""
+
+sql_select = f"""
+SELECT
+    atend.atendimento_id,
+    atend.dt_atendimento,
+    op.operacao,
+    ori.origem,
+    camp.campanha,
+    rec.recurso,
+    UPPER(rec.recurso_cod) AS recurso_cod,
+    ev.evento_id,
+    cp.classe_processo,
+    gp.grupo_processo,
+    tp.tipo_processo,
+    IIF(cpc.campo_txt = 'sim', 1, 0) AS cpc,
+    CASE WHEN sc.classe_processo_id IS NOT NULL THEN 1 ELSE 0 END AS sucesso,
+    cmp.premio,
+    atend.operacao_id,
+    GETDATE() AS loadDate
+FROM atendimento atend WITH (NOLOCK)
+INNER JOIN evento ev WITH (NOLOCK)
+    ON  ev.atendimento_id = atend.atendimento_id
+    AND ev.Parceiro_id NOT IN (0,1,20,21,22,23,26,124)
+INNER JOIN tipo_processo tp WITH (NOLOCK)
+    ON tp.tipo_processo_id = ev.tipo_processo_id
+INNER JOIN grupo_processo gp WITH (NOLOCK)
+    ON  gp.grupo_processo_id = tp.grupo_processo_id
+    AND gp.grupo_processo_id NOT IN (512, 513)
+LEFT JOIN operacao op WITH (NOLOCK)
+    ON op.operacao_id = atend.operacao_id
+LEFT JOIN origem ori WITH (NOLOCK)
+    ON ori.origem_id = atend.origem_id
+LEFT JOIN recurso rec WITH (NOLOCK)
+    ON rec.recurso_id = atend.recurso_id
+LEFT JOIN campanha camp WITH (NOLOCK)
+    ON camp.campanha_id = ev.campanha_id
+LEFT JOIN classe_processo cp WITH (NOLOCK)
+    ON cp.classe_processo_id = ev.classe_processo_id
+LEFT JOIN #sucesso sc
+    ON sc.classe_processo_id = ev.classe_processo_id
+LEFT JOIN configuracao_aux cpc WITH (NOLOCK)
+    ON  cpc.tlv_registro_id = ev.tipo_processo_id
+    AND cpc.campo_aux_id = 2126
+LEFT JOIN #campos cmp
+    ON cmp.evento_id = ev.evento_id
+WHERE atend.dt_atendimento >= '{dt_inicio}'
+  AND atend.dt_atendimento <  '{dt_fim_atend}';
+"""
+
+# ============================
+# 6. Criar tabela no DESTINO (se não existir)
+# ============================
+sql_create_destino = """
+IF OBJECT_ID('dbo.AgentPerformanceScore', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AgentPerformanceScore (
+        atendimento_id   INT            NOT NULL,
+        dt_atendimento   DATETIME       NULL,
+        operacao         VARCHAR(200)   NULL,
+        origem           VARCHAR(200)   NULL,
+        campanha         VARCHAR(200)   NULL,
+        recurso          VARCHAR(200)   NULL,
+        recurso_cod      VARCHAR(100)   NULL,
+        evento_id        INT            NULL,
+        classe_processo  VARCHAR(200)   NULL,
+        grupo_processo   VARCHAR(200)   NULL,
+        tipo_processo    VARCHAR(200)   NULL,
+        cpc              INT            NULL,
+        sucesso          INT            NULL,
+        premio           FLOAT          NULL,
+        operacao_id      INT            NULL,
+        loadDate         DATETIME       NOT NULL
+    );
+    CREATE CLUSTERED INDEX CIX_resultado_atendimento
+        ON dbo.AgentPerformanceScore (atendimento_id);
+END
+"""
+
+# ============================
+# 7. Execução
+# ============================
+chunk_size = 100_000
+total_rows = 0
+start_time = time.time()
+
+# 7a. Criar tabela no destino
+with engine_destino.begin() as conn_dest:
+    conn_dest.execute(text(sql_create_destino))
+    # Limpa dados do período para evitar duplicatas
+    conn_dest.execute(text(f"""
+        DELETE FROM dbo.AgentPerformanceScore
+        WHERE dt_atendimento >= '{dt_inicio}'
+          AND dt_atendimento <  '{dt_fim_atend}'
+    """))
+    print("Tabela destino preparada.")
+
+# 7b. Ler da origem (mesma raw connection para manter as temp tables)
+raw_conn = engine_origem.raw_connection()
+try:
+    cursor = raw_conn.cursor()
+    # Criar temp tables
+    cursor.execute(sql_setup)
+    while cursor.nextset():
+        pass
+    print("Temp tables criadas na origem.")
+
+    # Ler SELECT em chunks e gravar no destino
+    for chunk in pd.read_sql(sql_select, raw_conn, chunksize=chunk_size):
+        total_rows += len(chunk)
+        print(f"  Chunk: {len(chunk):,} linhas | Acumulado: {total_rows:,}")
+        chunk.to_sql(
+            name="AgentPerformanceScore",
+            schema="dbo",
+            con=engine_destino,
+            if_exists="append",
+            index=False,
+            chunksize=5_000,
+        )
+
+    # Cleanup temp tables
+    cursor.execute("DROP TABLE IF EXISTS #sucesso; DROP TABLE IF EXISTS #campos;")
+    raw_conn.commit()
+finally:
+    raw_conn.close()
+
+elapsed = time.time() - start_time
+print(f"\nFinalizado: {total_rows:,} linhas em {elapsed/60:.1f} minutos.")
